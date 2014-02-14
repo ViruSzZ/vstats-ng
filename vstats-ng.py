@@ -6,38 +6,87 @@
 import os, sys
 
 # path to vz stuff
-user_beans = "/proc/user_beancounters"
-vzlist_bin = "/usr/sbin/vzlist"
+user_beans  = "/proc/user_beancounters"
+vzlist_bin  = "/usr/sbin/vzlist"
+vz_confdir  = "/etc/vz/conf/"
 
 ####################### MAIN #######################
-def main():
-    preChecks(user_beans, vzlist_bin)
-    vs = parseVMStuff(vzlist_bin)
+def main(argv):
+    preChecks()
+    if len(argv) == 1:
+        vmid = fetchVmID(argv[0])
+    else:
+        vmid = None
+    vs = parseVMStuff(vzlist_bin,vmid)
     printResults(vs)
 ##################### END MAIN #####################
 
 
 ###################### METHODS #####################
-def preChecks(user_beans, vzlist):
+def preChecks():
     # check if we're on openvz
     if not os.path.isfile(user_beans):
         print "ERROR: I'm supposed to run on a Virtuozzo/OpenVZ host!"
         sys.exit(1)
 
     # is vzlist executable?
-    is_executable = os.path.isfile(vzlist) and os.access(vzlist, os.X_OK)
+    is_executable = os.path.isfile(vzlist_bin) and os.access(vzlist_bin, os.X_OK)
     if not is_executable:
-        print "ERROR: %r is not a file or did not have executable bit on it." % vzlist
+        print "ERROR: %r is not a file or did not have executable bit on it." % vzlist_bin
         sys.exit(1)
 
-def parseVMStuff(vzlist):
+    # is vz conf dir present?
+    if not os.path.isdir(vz_confdir):
+        print "ERROR: %r does not exist or is not a directory." % vz_confdir
+        sys.exit(1)
+
+def fetchVmID(pattern):
+    # pattern is actually a running VMID?
+    if os.path.isdir('/proc/bc/'+pattern):
+        return pattern
+
+    import subprocess
+    try:
+        grep_raw = subprocess.Popen( 'grep -iolw ' + pattern + ' ' + vz_confdir + '*.conf', stdout=subprocess.PIPE, shell=True ).communicate()[0]
+    except OSError:
+        pass
+    # no match found
+    if not grep_raw:
+        print "ERROR: No matching VMID has been found for %r" % pattern
+        sys.exit(1)
+
+    query = os.path.splitext(grep_raw)[0].split("\n")
+    # more than one match?
+    if len(query) > 1:
+        vmids = []
+        for veid in query:
+            #if isinstance( veid, int ):
+            if os.path.isdir( '/proc/bc/' + os.path.basename(os.path.splitext(veid)[0]) ):
+                vmids.append( os.path.basename(os.path.splitext(veid)[0]) )
+        return vmids
+
+    vmid = os.path.basename( os.path.splitext(grep_raw)[0] )
+    # check if /proc/bc/$VMID exist
+    if not os.path.isdir('/proc/bc/'+vmid):
+        print "ERROR: Matched VMID %r doesn't seem like it's running! try `vzlist -a -t %s`" % (vmid, vmid)
+        sys.exit(1)
+
+    return vmid
+
+def parseVMStuff(vzlist,vmid):
     import subprocess
     import re
 
     # load up output of vzlist
     try:
-        vz_fields = 'laverage,ip,veid,hostname,cpus,numproc,diskspace,physpages'
-        vz_input  = subprocess.Popen( [vzlist, '-H', '-o', vz_fields], stdout=subprocess.PIPE ).communicate()[0]
+        vz_fields = 'laverage,ip,veid,hostname,cpus,numproc,diskspace,physpages,ostemplate'
+        if not vmid:
+            vz_input  = subprocess.Popen( [vzlist, '-H', '-o', vz_fields], stdout=subprocess.PIPE ).communicate()[0]
+        else:
+            # process if multiple vmid's
+            if isinstance(vmid, list):
+                vmid = " ".join(vmid)
+            vz_input = subprocess.Popen( vzlist + ' -H ' + vmid + ' -o ' + vz_fields, stdout=subprocess.PIPE, shell=True ).communicate()[0]
     except OSError:
         pass
 
@@ -45,12 +94,16 @@ def parseVMStuff(vzlist):
 
     # no running containers
     if len(vz) <= 1:
-        sys.exit()
+        sys.exit(1)
 
     vs = {}
 
     # load-up our goodies
     for i in range( 0, len(vz) - 1, 1 ):
+
+        # unexpeted input as vmid?
+        if not os.path.isdir('/proc/bc/' + vz[i][2]):
+            break
 
         # get mem-free
         vm_ram = open('/proc/bc/' + vz[i][2] + '/meminfo', 'r')
@@ -61,17 +114,6 @@ def parseVMStuff(vzlist):
             elif l > 1:
                 break
         vm_ram.close()
-
-        # get distro template
-        with open('/etc/vz/conf/' + vz[i][2] + '.conf', 'r') as vz_conf:
-            for line in vz_conf:
-                match = re.search('OSTEMPLATE="(.*)"', line)
-                if match:
-                    distro = re.sub( '\.tar\.gz', '', match.group(1) )
-                    break
-                else:
-                    distro = "N/A"
-        vz_conf.close()
 
         # determine if da, cpanel or webmin is used
         webmin  = '/vz/private/' + vz[i][2] + '/usr/libexec/webmin/miniserv.pl'
@@ -96,6 +138,7 @@ def parseVMStuff(vzlist):
                         break
                     else:
                         hit = '-'
+        vz_proc.close()
 
         # load-up our goodies
         vs[ vz[i][2] ] = {
@@ -107,7 +150,7 @@ def parseVMStuff(vzlist):
             'hdd'       : int(vz[i][6]) / 1024 / 1024,
             'ram'       : int(vz[i][7]) / 256, # asume page is 4K (x86/amd64)
             'ram.free'  : ram_free,
-            'distro'    : distro,
+            'distro'    : re.sub('\.tar\.gz', '', vz[i][8]),
             'panel'     : panel,
             'hit'       : hit
         }
@@ -116,17 +159,19 @@ def parseVMStuff(vzlist):
 
 def printResults(vs):
     os.system('clear')
-    head_format = COLOR['DARK_YELLOW'] + "%-20s %-5s %-16s %-30s %-7s %-7s %-10s %-15s %-5s %-25s %-10s" + COLOR['RESET']
-    body_format = "%-20s %-5s %-16s %-30s %-7s %-7s %-10s %-15s %-5s %-25s %-10s"
+    head_format = COLOR['DARK_YELLOW'] + "%-20s %-5s %-16s %-37s %-7s %-7s %-10s %-12s %-5s %-25s %-10s" + COLOR['RESET']
+    body_format = "%-20s %-5s %-16s %-37s %-7s %-7s %-10s %-12s %-5s %-25s %-10s"
     print head_format % ("LOAD AVERAGE", "VMID", "IP ADDRESS", "HOSTNAME", "#CPU", "#PROC", "DISK(GB)", "RAM(u/f)MB", "HIT", "DISTRIBUTION", "CONTROL PANEL")
-    print COLOR['GREY30'] + '-' * 165 + COLOR['RESET']
+    print COLOR['GREY30'] + '-' * 168 + COLOR['RESET']
 
     for v in sorted(vs.keys()):
         ram = str(vs[v]['ram']) + ' / ' + str(vs[v]['ram.free'])
         print body_format % (vs[v]['load'], v, vs[v]['ip'], vs[v]['host'], vs[v]['no.cpu'], vs[v]['no.proc'], vs[v]['hdd'], ram, vs[v]['hit'], vs[v]['distro'], vs[v]['panel'])
 
+    print "\nNumber of servers: %d" % len(vs.keys())
+    print "Host Load Average: %.2f/%.2f/%.2f" % (os.getloadavg()[0], os.getloadavg()[1], os.getloadavg()[2])
 
-# colorful output
+# colorful output -- TODO
 COLOR={
     'RESET'             : '\033[0m',  # RESET COLOR
     'BOLD'              : '\033[1m',
@@ -172,4 +217,4 @@ COLOR={
 
 ##################### EXECUTE MAIN #####################
 if __name__ == '__main__':
-    main()
+    main(sys.argv[1:])
