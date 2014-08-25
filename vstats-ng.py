@@ -14,7 +14,7 @@ vz_confdir  = "/etc/vz/conf/"
 def main(argv):
     preChecks()
     if len(argv) == 1:
-        vmid = fetchVmID(argv[0])
+        vmid = fetchVmID(vzlist_bin,argv[0])
     else:
         vmid = None
     vs = parseVMStuff(vzlist_bin,vmid)
@@ -40,14 +40,15 @@ def preChecks():
         print "ERROR: %r does not exist or is not a directory." % vz_confdir
         sys.exit(1)
 
-def fetchVmID(pattern):
+def fetchVmID(vzlist,pattern):
     # pattern is actually a running VMID?
     if os.path.isdir('/proc/bc/'+pattern):
         return pattern
 
     import subprocess
     try:
-        grep_raw = subprocess.Popen( 'grep -iolw ' + pattern + ' ' + vz_confdir + '*.conf', stdout=subprocess.PIPE, shell=True ).communicate()[0]
+        vzlist_raw  = subprocess.Popen( [vzlist, '-H', '-a'], stdout=subprocess.PIPE )
+        grep_raw    = subprocess.Popen(('grep', '-i', pattern), stdin=vzlist_raw.stdout, stdout=subprocess.PIPE).communicate()[0]
     except OSError:
         pass
     # no match found
@@ -55,17 +56,19 @@ def fetchVmID(pattern):
         print "ERROR: No matching VMID has been found for %r" % pattern
         sys.exit(1)
 
-    query = os.path.splitext(grep_raw)[0].split("\n")
+    query = [x.strip() for x in grep_raw.split("\n")]
+
     # more than one match?
     if len(query) > 1:
         vmids = []
-        for veid in query:
-            #if isinstance( veid, int ):
-            if os.path.isdir( '/proc/bc/' + os.path.basename(os.path.splitext(veid)[0]) ):
-                vmids.append( os.path.basename(os.path.splitext(veid)[0]) )
+        #for veid in query:
+        for line in filter(None, query):
+            if os.path.isdir( '/proc/bc/' + line.split()[0] ):
+                vmids.append( line.split()[0] )
         return vmids
 
-    vmid = os.path.basename( os.path.splitext(grep_raw)[0] )
+    vmid = line.split()[0]
+
     # check if /proc/bc/$VMID exist
     if not os.path.isdir('/proc/bc/'+vmid):
         print "ERROR: Matched VMID %r doesn't seem like it's running! try `vzlist -a -t %s`" % (vmid, vmid)
@@ -147,7 +150,7 @@ def parseVMStuff(vzlist,vmid):
             'host'      : vz[i][3],
             'no.cpu'    : vz[i][4],
             'no.proc'   : vz[i][5],
-            'hdd'       : int(vz[i][6]) / 1024 / 1024,
+            'hdd'       : int(vz[i][6]) / 1024 / 1024 if vz[i][6] != '-' else "N/A",
             'ram'       : int(vz[i][7]) / 256, # asume page is 4K (x86/amd64)
             'ram.free'  : ram_free,
             'distro'    : re.sub('\.tar\.gz', '', vz[i][8]),
@@ -159,17 +162,41 @@ def parseVMStuff(vzlist,vmid):
 
 def printResults(vs):
     os.system('clear')
-    head_format = COLOR['DARK_YELLOW'] + "%-20s %-5s %-16s %-37s %-7s %-7s %-10s %-12s %-5s %-25s %-10s" + COLOR['RESET']
-    body_format = "%-20s %-5s %-16s %-37s %-7s %-7s %-10s %-12s %-5s %-25s %-10s"
+    head_format = COLOR['YELLOW'] + "%-20s %-9s %-16s %-37s %-7s %-7s %-10s %-12s %-5s %-25s %-10s" + COLOR['RESET']
+    #body_format = "%-20s %-9s %-16s %-37s %-7s %-7s %-10s %-12s %-5s %-25s %-10s"
     print head_format % ("LOAD AVERAGE", "VMID", "IP ADDRESS", "HOSTNAME", "#CPU", "#PROC", "DISK(GB)", "RAM(u/f)MB", "HIT", "DISTRIBUTION", "CONTROL PANEL")
-    print COLOR['GREY30'] + '-' * 168 + COLOR['RESET']
+    print COLOR['BOLD'] + COLOR['DARK_MAGENTA'] + '-' * 171 + COLOR['RESET']
 
     for v in sorted(vs.keys()):
         ram = str(vs[v]['ram']) + ' / ' + str(vs[v]['ram.free'])
+        # test
+        ve_1_load = float(vs[v]['load'].split('/')[0])
+        if ve_1_load >= 1.0:
+            body_format = COLOR['LIGHT_RED_BG'] + "%-20s %-9s %-16s %-37s %-7s %-7s %-10s %-12s %-5s %-25s %-10s" + COLOR['RESET']
+        elif ve_1_load < 1.0 and ve_1_load >= 0.5:
+            body_format = COLOR['DARK_YELLOW'] + "%-20s %-9s %-16s %-37s %-7s %-7s %-10s %-12s %-5s %-25s %-10s" + COLOR['RESET']
+        elif ve_1_load < 0.5 and ve_1_load >= 0.3:
+            body_format = COLOR['GREEN'] + "%-20s %-9s %-16s %-37s %-7s %-7s %-10s %-12s %-5s %-25s %-10s" + COLOR['RESET']
+        else:
+            body_format = "%-20s %-9s %-16s %-37s %-7s %-7s %-10s %-12s %-5s %-25s %-10s"
+        # end test
         print body_format % (vs[v]['load'], v, vs[v]['ip'], vs[v]['host'], vs[v]['no.cpu'], vs[v]['no.proc'], vs[v]['hdd'], ram, vs[v]['hit'], vs[v]['distro'], vs[v]['panel'])
 
-    print "\nNumber of servers: %d" % len(vs.keys())
-    print "Host Load Average: %.2f/%.2f/%.2f" % (os.getloadavg()[0], os.getloadavg()[1], os.getloadavg()[2])
+    nr_vpses_format = COLOR['YELLOW'] + "%d" + COLOR['RESET']
+    print "\nTotal vServers: " + nr_vpses_format % len(vs.keys())
+
+    try:
+        conn_track_format = COLOR['YELLOW'] + "%d / %d" + COLOR['RESET']
+        with open('/proc/sys/net/netfilter/nf_conntrack_max', 'r') as f:
+            max_conn = int(f.readline())
+        with open('/proc/sys/net/netfilter/nf_conntrack_count', 'r') as f:
+            cur_conn = int(f.readline())
+        print "Connections [cur/max]: " + conn_track_format % (cur_conn, max_conn)
+    except:
+        pass
+
+    host_load_format = COLOR['YELLOW'] + "%.2f %.2f %.2f" + COLOR['RESET']
+    print  "Node Load Average: " + host_load_format % (os.getloadavg()[0], os.getloadavg()[1], os.getloadavg()[2])
 
 # colorful output -- TODO
 COLOR={
@@ -205,7 +232,7 @@ COLOR={
     'MAGENTA_BG'        : '\033[45m',
     'LIGHT_PURPLE_BG'   : '\033[105m',
     'DARK_CYAN'         : '\033[36m',
-    'AUQA'              : '\033[96m',
+    'AQUA'              : '\033[96m',
     'CYAN_BG'           : '\033[46m',
     'LIGHT_AUQA_BG'     : '\033[106m',
     'DARK_GREEN'        : '\033[32m',
